@@ -992,7 +992,7 @@ thresholds = np.arange(0.1, 1, 0.1)
 weight_combinations = [(x/10, y/10, z/10) for x in range(1, 10) for y in range(2, 10) for z in range(2, 10) if x + y + z == 10]
 
 # Run the complete bootstrap
-bootstraps, train_results_df, test_results_df = bootstrap(data, data_duplicates, binary_vectors, 1024, 5, 800, weight_combinations, thresholds, precomputed_matrices)
+bootstraps, train_results_df, test_results_df = bootstrap(data, data_duplicates, binary_vectors, 1024, 8, 800, weight_combinations, thresholds, precomputed_matrices)
 
 ######################## Part 9.4: bootstrap - plotting ########################
 
