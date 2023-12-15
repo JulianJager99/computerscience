@@ -1,0 +1,1060 @@
+######################## Part 1: file preparation ########################
+
+
+# Reset the directory of the file
+%reset -f
+
+# Import all packages
+import json
+import re
+from collections import defaultdict
+import random
+import numpy as np
+import hashlib
+import pandas as pd
+from itertools import combinations
+import matplotlib.pyplot as plt
+from concurrent.futures import ProcessPoolExecutor
+import scipy.cluster.hierarchy as sch
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage, fcluster
+from difflib import SequenceMatcher
+from collections import Counter
+from scipy.stats import hmean
+import matplotlib.pyplot as plt
+import matplotlib
+from matplotlib import rc
+import copy
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as font_manager
+import Levenshtein
+
+######################## Part 2.1: data preparation - loading the file ########################
+
+
+# Load the JSON data from the file
+json_data_path = '/Users/julianjager/Library/CloudStorage/GoogleDrive-julianjager22@gmail.com/My Drive/Master/Blok 2/Computer Science for Business Analytics/Paper/TVs-all-merged.json'
+
+# Read the JSON content
+with open(json_data_path, 'r') as file:
+    data = json.load(file)
+    
+# Make a list for every product and assign simple numeric id's instead of the current model id's
+def flatten_dataset_and_assign_ids(data):
+    flattened_data = []
+    model_id_to_numeric_ids = defaultdict(list)
+    numeric_id = 0
+
+    for model_group in data.values():
+        for product in model_group:
+            # Assign a numeric ID to the product
+            product['numeric_id'] = numeric_id
+            flattened_data.append(product)
+
+            # Track which numeric IDs share the same model ID
+            model_id_to_numeric_ids[product['modelID']].append(numeric_id)
+
+            # Increment the numeric ID for the next product
+            numeric_id += 1
+
+    return flattened_data, model_id_to_numeric_ids
+
+# Apply the function on the json file
+data, model_id_to_numeric_ids = flatten_dataset_and_assign_ids(data)
+
+
+######################## Part 2.2: data preparation - duplicate detection set ########################
+
+
+# Check which products have duplicates
+data_duplicates = {model_id: ids for model_id, ids in model_id_to_numeric_ids.items() if len(ids) > 1}  
+
+# Make a function that identifies a set of duplicate pairs
+def generate_duplicate_pairs(data_duplicates):
+    pairs = set()
+    for duplicate_indices in data_duplicates.values():
+        for pair in combinations(duplicate_indices, 2):
+            pairs.add(frozenset(pair))  # Using frozenset for hashability
+    return pairs
+
+# Usage with data_duplicates
+data_duplicates = generate_duplicate_pairs(data_duplicates)
+
+
+######################## Part 2.3: data preparation - subsetting ########################
+
+
+# Make a function that subsets the data into a random train and test set
+def generate_train_test_split(subset_size, data, data_duplicates):
+    # Generating a random subset of indices for training data
+    train_indices = set(random.sample(range(len(data)), subset_size))
+    test_indices = set(range(len(data))) - train_indices
+
+    # Creating train and test datasets
+    train_data = [data[i] for i in train_indices]
+    test_data = [data[i] for i in test_indices]
+
+    # Function to update numeric_id and old_numeric_id
+    def update_ids(dataset):
+        for new_id, product in enumerate(dataset):
+            product['old_numeric_id'] = product['numeric_id']
+            product['numeric_id'] = new_id
+
+    # Updating IDs for train and test data
+    update_ids(train_data)
+    update_ids(test_data)
+
+    # Function to create duplicates mapping
+    def create_duplicates(dataset_indices, data_duplicates):
+        id_mapping = {old_id: new_id for new_id, old_id in enumerate(dataset_indices)}
+        dataset_duplicates = {frozenset((id_mapping.get(pair_id, -1) for pair_id in pair))
+                              for pair in data_duplicates if all(pair_id in id_mapping for pair_id in pair)}
+        return {pair for pair in dataset_duplicates if not -1 in pair}
+
+    # Creating duplicates for train and test data
+    train_duplicates = create_duplicates(train_indices, data_duplicates)
+    test_duplicates = create_duplicates(test_indices, data_duplicates)
+
+    return train_data, train_duplicates, test_data, test_duplicates
+
+# Check if the numeric id's are correctly transformed in each step
+def test_duplicate_correction(dataset, duplicates):
+    def get_model_id(numeric_id):
+        return next((item['modelID'] for item in dataset if item['numeric_id'] == numeric_id), None)
+
+    # Iterate over each pair of duplicates
+    for pair in duplicates:
+        # Extracting ModelIDs for each numeric_id in the pair
+        model_ids = [get_model_id(numeric_id) for numeric_id in pair]
+
+        # Check if all ModelIDs in the pair are the same
+        if not all(model_id == model_ids[0] for model_id in model_ids):
+            return False
+
+    return True
+
+
+######################## Part 2.4: data preparation - standardization ########################
+
+
+# Make a function that standardizes measurements
+def standardize_units(text):
+    text = re.sub(r'\s*(Inch|inches|”|-inch|"|\”)', 'inch', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*(Hertz|hertz|Hz|-hz)', 'hz', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*(lbs|lb|Lbs|Lb|LBS|LB)', 'lbs', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*(kg|Kg|KG)', 'kg', text, flags=re.IGNORECASE)
+    return text
+
+# Make a function that removes spaces and dashes before measurements
+def remove_space_and_dash_before_units(text):
+    units_to_remove_space_and_dash = ['inch', 'hz', 'lbs', 'kg', 'watt', 'volt', 'cdm2', 'kwhy']
+    for unit in units_to_remove_space_and_dash:
+        pattern = r'\s*-?' + re.escape(unit)
+        text = re.sub(pattern, unit, text, flags=re.IGNORECASE)
+    return text
+
+# Make a function that applies the functions above for a single string
+def clean_text(text):
+    text = text.lower()
+    text = standardize_units(text)
+    text = remove_space_and_dash_before_units(text)
+    return text
+
+# Make a function that applies the functions for a list
+def clean_and_standardize(obj):
+    if isinstance(obj, dict):
+        return {key: clean_and_standardize(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_and_standardize(element) for element in obj]
+    elif isinstance(obj, str):
+        return clean_text(obj)
+    else:
+        return obj
+
+# Apply the functions above
+data = clean_and_standardize(data)
+
+
+######################## Part 3.1: binary vector - model words ########################
+
+
+# Define the regex that finds model words
+regex_model_words = r'([a-zA-Z0-9]*(([0-9]+(\.[0-9]+)?[^0-9, ]+)|([^0-9, ]+[0-9]+(\.[0-9]+)?))[a-zA-Z0-9]*)'
+
+# Make a function that finds all occurrencies of a pattern in a text
+def find_model_words(text, pattern):
+    return re.findall(pattern, text)
+
+# Make a function that finds model words
+def find_model_words_in_map(data, pattern):
+    # Create an empty set to store model words
+    model_words = set()
+    # Iterate through all products
+    for record in data:
+        # Use the title text to find the model words
+        title = record.get('title', '')
+        if isinstance(title, str):
+            found_words = find_model_words(title, pattern)
+            for word in found_words:
+                model_words.add(word[0])
+    return model_words
+
+# Find the model words of the dataset
+model_words = find_model_words_in_map(data, regex_model_words)
+
+
+######################## Part 3.2.1: binary vector - finding brands ########################
+
+
+# Define a list of brands
+brands = [
+    "acer", "admiral", "aiwa", "akai", "alba", "amstrad", "andrea electronics",
+    "apex digital", "apple", "arcam", "arise india", "aga ab", "audiovox", "awa",
+    "baird", "bang & olufsen", "beko", "benq", "binatone", "blaupunkt", "bpl group",
+    "brionvega", "bush", "canadian general electric", "changhong", "chimei",
+    "compal electronics", "conar instruments", "continental edison", "cossor",
+    "craig", "curtis mathes corporation", "daewoo", "dell", "delmonico international corporation",
+    "dumont laboratories", "durabrand", "dynatron", "english electric", "english electric valve company",
+    "ekco", "electrohome", "element electronics", "emerson electric", "emi",
+    "farnsworth", "ferguson electronics", "ferranti", "finlux", "fisher electronics",
+    "fujitsu", "funai", "geloso", "general electric", "general electric company",
+    "goldstar", "goodmans industries", "gradiente", "grundig",
+    "haier", "hallicrafters", "hannspree", "heath company", "hinari domestic appliances",
+    "hmv", "hisense", "hitachi", "hoffman television", "itel",
+    "itt corporation", "jensen loudspeakers", "jvc", "kenmore", "kent television",
+    "kloss video", "kogan", "kolster-brandes", "konka", "lanix",
+    "le.com", "loewe", "luxor", "magnavox",
+    "marantz", "marconiphone", "matsui", "memorex", "micromax",
+    "metz", "mitsubishi", "mivar", "motorola", "muntz",
+    "murphy radio", "nec", "nokia", "nordmende", "onida",
+    "orion", "packard bell", "panasonic", "pensonic", "philco",
+    "philips", "pioneer", "planar systems", "polaroid", "proline",
+    "proscan", "pye", "pyle usa", "quasar", "radioshack",
+    "rauland-borg", "rca", "realistic", "rediffusion", "saba",
+    "salora", "salora international", "sansui", "sanyo", "schneider electric",
+    "seiki digital", "seleco", "setchell carlson", "sharp", "siemens",
+    "skyworth", "sony", "soyo", "stromberg-carlson", "supersonic",
+    "sylvania", "tandy", "tatung company", "tcl corporation", "technics",
+    "teco", "teleavia", "telefunken", "teletronics", "thomson sa",
+    "thorn electrical industries", "thorn emi", "toshiba", "tpv technology", "tp vision",
+    "united states television manufacturing corp.", "vestel", "videocon", "videoton",
+    "vizio", "vu televisions", "walton", "westinghouse electric corporation", "westinghouse electronics",
+    "white-westinghouse", "xiaomi", "zanussi", "zenith radio", "zonda",
+    "samsung", "lg", "sony", "vizio", "philips", "panasonic", "sharp", "toshiba", "jvc", "hisense", 
+    "tcl", "sceptre", "polaroid", "insignia", "hitachi", "rca", "sansui", "coby", "supersonic", "mitsubishi", 
+    "viore", "sigmac", "epson", "upstar", "seiki", "apple", "magnavox", "sunbritetv", "viewsonic", "sanyo",
+    "westinghouse", "venturer", "optoma", "avue", "naxa", "pyle", "dynex", "azend", "elite"
+]
+
+# Some brands are duplicate, hence we account for this by making the brand list a set of brands
+brands = list(set(brands))
+
+# Make a function that finds brand names in titles
+def find_brand_names_in_titles(data):
+    brand_names = set()
+    for record in data:
+        title = record.get('title', '').lower()  # Convert the title to lowercase for consistent matching
+        # Split the title into words and check for common TV brand names
+        for word in title.split():
+            if word in brands:
+                brand_names.add(word)  
+    return brand_names
+
+# Extract brand names from the 'title' field of each record
+brand_names = find_brand_names_in_titles(data)
+
+
+######################## Part 3.2.3: binary vector - add brands to dataset ########################
+
+
+# Make a function that adds brands to the dataset
+def add_brands_to_products(data, brands):
+    for product in data:
+        title = product.get('title', '').lower()
+        product_brand = None
+        for brand in brands:
+            if brand in title:
+                product_brand = brand
+                break
+        product['brand'] = product_brand
+    return data
+
+# Apply the function
+data = add_brands_to_products(data, brands)
+
+# Make a function that checks which products have multiple brands, as this might give issues in the MSM
+def check_multiple_brands(data, brands):
+    products_with_multiple_brands = []
+    for product in data:
+        title = product.get('title', '').lower()
+        found_brands = [brand for brand in brands if brand in title]
+        if len(found_brands) > 1:
+            products_with_multiple_brands.append({'title': product['title'], 'brands': found_brands})
+    return products_with_multiple_brands
+
+# Make a dataframe with products with multiple brands
+products_with_multiple_brands = check_multiple_brands(data, brands)
+
+
+######################## Part 3.2.4: binary vector - mannually check on additional brands ########################
+
+
+# Make a function that checks words in products without a brand, for mannual brand checking
+def find_products_without_brand_and_extract_words(data):
+    products_without_brand = []
+    for product in data:
+        # Check if the product does not have a brand or the brand is None
+        if 'brand' not in product or product['brand'] is None:
+            title = product.get('title', '')
+            # Extract words that consist only of letters
+            words = re.findall(r'\b[a-zA-Z]+\b', title)
+            products_without_brand.append({'title': title, 'words': words})
+    return products_without_brand
+
+# Apply the function
+find_products_without_brand_and_extract_words(data)
+
+
+######################## Part 3.3: binary vector - extracting key-value pairs ########################
+
+
+# Make regex to find decimal numbers with optional alphabetic characters
+regex = r"^\d+(\.\d+)?([a-zA-Z]+)?$"
+
+# Function to extract numerical values from key-value pairs in a list of products
+def extract_numerical_kvp(data):
+    extracted_data = defaultdict(dict)
+    for product in data:
+        kvp = product.get("featuresMap", {})
+        numerical_kvp = {key: re.match(regex, value).group() if re.match(regex, value) else None
+                         for key, value in kvp.items()}
+        # Filter out None values and keep only numerical part
+        numerical_kvp = {key: re.sub(r'[a-zA-Z]+', '', value) if value is not None else None 
+                         for key, value in numerical_kvp.items()}
+        extracted_data[product.get("modelID")] = numerical_kvp
+    return extracted_data
+
+# Apply the function to the dataset
+numerical_kvps = extract_numerical_kvp(data)
+
+# Collect all numerical values from the KVPs
+all_numerical_values = set()
+for _, kvp in numerical_kvps.items():
+    all_numerical_values.update(kvp.values())
+
+# Remove any None values that might have been added
+all_numerical_values.discard(None)
+
+
+######################## Part 3.4: binary vector - definition binary vector ########################
+
+
+# Combine all features extracted above
+all_features = set(model_words).union(brand_names, all_numerical_values)
+
+# Make a function to create a binary feature vector for a product based on its features
+def create_binary_vector(product, all_features):
+    binary_vector = []
+    title = product.get('title', '').lower()
+    features_map = product.get('featuresMap', {})
+    for feature in all_features:
+        if feature in title or feature in features_map.values():
+            binary_vector.append(1)
+        else:
+            binary_vector.append(0)
+    return (binary_vector)
+
+# Create the binary vector
+binary_vectors = [create_binary_vector(product, all_features) for product in data]
+
+
+######################## Part 4.1: signature matrix - hash functions ########################
+
+
+# Make a function that generates a list of hash functions
+def generate_hash_functions(num_hashes, num_features):
+    hash_functions = []
+    for i in range(num_hashes):
+        a = random.randint(1, num_features - 1)
+        b = random.randint(0, num_features - 1)
+        hash_functions.append((a, b))
+    return hash_functions
+
+# Find the next prime number greater than the input
+def next_prime(n):
+    if n <= 1:
+        return 2
+    if n % 2 == 0:
+        n += 1
+    while not is_prime(n):
+        n += 2
+    return n
+
+# Check if a number is prime
+def is_prime(num):
+    if num <= 1:
+        return False
+    if num <= 3:
+        return True
+    if num % 2 == 0 or num % 3 == 0:
+        return False
+    i = 5
+    while i * i <= num:
+        if num % i == 0 or num % (i + 2) == 0:
+            return False
+        i += 6
+    return True
+
+
+######################## Part 4.2: signature matrix - definition signature matrix ########################
+
+
+# Number of hashfunctions used in minhashing
+num_hashes = 1500 
+
+# Make a function that creates a signature matrix using minhashing
+def create_signature_matrix(binary_vectors, num_hashes):
+    num_products = len(binary_vectors)
+    # Ensure that we have binary vectors to process
+    num_features = len(binary_vectors[0]) if binary_vectors else 0
+    # Generate a list of random hash functions
+    hash_functions = generate_hash_functions(num_hashes, num_features)
+    # Initialize a signature matrix with infinity values
+    signature_matrix = np.full((num_hashes, num_products), np.inf)
+    
+    # Iterate over hash functions and binary vectors to fill in the signature matrix
+    for i, (a, b) in enumerate(hash_functions):
+        for j, binary_vector in enumerate(binary_vectors):
+            for k, value in enumerate(binary_vector):
+                if value == 1:
+                    # Apply the hash function and update the signature matrix if the hash value is smaller
+                    hash_val = (a * k + b) % next_prime(num_features)
+                    if hash_val < signature_matrix[i, j]:
+                        signature_matrix[i, j] = hash_val
+
+    return signature_matrix
+
+# Create a signature matrix for the given binary vectors 
+signature_matrix = create_signature_matrix(binary_vectors, num_hashes)
+
+
+######################## Part 5.1: lsh - definition lsh ########################
+
+
+# Define a LSH function
+def locality_sensitive_hashing(signature_matrix, num_bands, num_rows):
+    num_hashes, num_products = signature_matrix.shape
+    assert num_hashes == num_bands * num_rows
+    
+    buckets = defaultdict(set)
+    for band_index in range(num_bands):
+        for product_index in range(num_products):
+            start_row = band_index * num_rows
+            end_row = start_row + num_rows
+            band_slice = signature_matrix[start_row:end_row, product_index]
+            bucket_key = hashlib.sha1(band_slice.tobytes()).hexdigest()
+            buckets[bucket_key].add(product_index)
+    return buckets
+
+# Make a function that prints the LSH buckets
+def print_lsh_buckets(lsh_buckets):
+    for bucket_key, product_indices in lsh_buckets.items():
+        print(f"Bucket {bucket_key}: {list(product_indices)}")
+        print()
+
+
+######################## Part 5.2: lsh - evaluation lsh over different band and rows ########################
+
+
+# Make a function that computes pair quality and pair completeness
+def calculate_pair_metrics(lsh_buckets, data_duplicates):
+    # Initialize the count of duplicates found
+    nr_duplicates_found = 0
+    found_duplicate_pairs = set()
+
+    # Check each bucket for duplicates
+    for _, product_indices in lsh_buckets.items():
+        for duplicate_pair in data_duplicates:
+            if duplicate_pair.issubset(product_indices) and duplicate_pair not in found_duplicate_pairs:
+                nr_duplicates_found += 1
+                found_duplicate_pairs.add(duplicate_pair)
+
+    # Calculate nr_comparisons
+    nr_comparisons = sum(len(indices) * (len(indices) - 1) // 2 for indices in lsh_buckets.values())
+
+    # Calculate total number of actual duplicate pairs
+    total_actual_duplicate_pairs = len(data_duplicates)
+
+    # Calculate Pair Quality and Pair Completeness
+    pair_quality = nr_duplicates_found / nr_comparisons if nr_comparisons else 0
+    pair_completeness = nr_duplicates_found / total_actual_duplicate_pairs if total_actual_duplicate_pairs else 0
+
+    return pair_quality, pair_completeness
+
+
+# Make a function that computes the fraction of comparisons
+def calculate_fraction_of_comparisons(lsh_buckets, total_possible_comparisons):
+    unique_comparisons = set()
+    for bucket in lsh_buckets.values():
+        for pair in combinations(bucket, 2):
+            unique_comparisons.add(frozenset(pair))
+    
+    return len(unique_comparisons) / total_possible_comparisons if total_possible_comparisons else 0
+
+# Function to calculate the harmonic mean
+def calculate_f1_star(row):
+    return hmean([row['pair_quality'], row['pair_completeness']])
+
+
+######################## Part 6.1: similarity metrics - HSM ########################
+
+
+# Make a function that extracts model words from kvps
+def extract_model_words_from_kvp(kvp):
+    model_word_pattern = regex_model_words
+    model_words = []
+    for key, value in kvp.items():
+        model_words.extend(re.findall(model_word_pattern, value.lower()))
+    return model_words
+
+# Function to calculate the percentage of matching model words
+def calculate_matching_model_words_percentage(kvp1, kvp2):
+    model_words_1 = extract_model_words_from_kvp(kvp1)
+    model_words_2 = extract_model_words_from_kvp(kvp2)
+
+    counter1 = Counter(model_words_1)
+    counter2 = Counter(model_words_2)
+
+    common_model_words = sum((counter1 & counter2).values())
+    total_model_words = len(model_words_1) + len(model_words_2)
+
+    if total_model_words == 0:
+        return 0
+    return common_model_words / total_model_words
+
+# Function that generates q-grams
+def qgrams(string, q):
+    return [string[i:i+q] for i in range(len(string) - q + 1)]
+
+# Function that computes q-gram similarities
+def qgram_similarity(str1, str2, q=3):
+    qgrams_str1 = set(qgrams(str1, q))
+    qgrams_str2 = set(qgrams(str2, q))
+    
+    common = qgrams_str1.intersection(qgrams_str2)
+    total = qgrams_str1.union(qgrams_str2)
+    
+    return len(common) / len(total) if total else 0.0
+
+# Function that computes HSM similarity
+def calculate_hsm_similarity(product1, product2, q=3, theta=0.5):
+    kvp1 = product1.get('featuresMap', {})
+    kvp2 = product2.get('featuresMap', {})
+
+    # Calculate KVP Similarity
+    sim_sum = 0
+    match_count = 0
+    for key1, value1 in kvp1.items():
+        for key2, value2 in kvp2.items():
+            key_similarity = qgram_similarity(key1, key2, q)
+            if key_similarity > 0.5:  
+                sim_sum += qgram_similarity(value1, value2, q)
+                match_count += 1
+
+    avg_sim = sim_sum / match_count if match_count > 0 else 0
+
+    # Calculate Model Words Similarity
+    mw_similarity = calculate_matching_model_words_percentage(kvp1, kvp2)
+
+    # Combine using theta
+    hybrid_similarity = theta * avg_sim + (1 - theta) * mw_similarity
+
+    return hybrid_similarity
+
+
+######################## Part 6.2: similarity metrics - KVP qgram ########################
+
+
+# Function that generates q-grams
+def qgrams(string, q):
+    return [string[i:i+q] for i in range(len(string) - q + 1)]
+
+# Function that computes q-gram similarities of two strings
+def qgram_similarity(str1, str2, q=3):
+    qgrams_str1 = set(qgrams(str1, q))
+    qgrams_str2 = set(qgrams(str2, q))
+    
+    common = qgrams_str1.intersection(qgrams_str2)
+    total = qgrams_str1.union(qgrams_str2)
+    
+    if total:
+        return len(common) / len(total)
+    else:
+        return 0.0
+
+# Function that computes similarities between two products
+def calculate_kvp_similarity(product1, product2, threshold=0.5, q=3):
+    similarity_measure = 0
+    count = 0
+
+    kvp1 = product1.get('featuresMap', {})
+    kvp2 = product2.get('featuresMap', {})
+
+    for key1 in kvp1:
+        for key2 in kvp2:
+            if qgram_similarity(key1, key2, q) >= threshold:
+                similarity_measure += qgram_similarity(key1, key2, q)
+                count += 1
+
+    return similarity_measure / count if count > 0 else 0
+
+
+######################## Part 6.2: similarity metrics - model words title ########################
+
+
+
+# Function that computes normalized Levenshtein similarity
+def normalized_levenshtein(str1, str2):
+    seq_match = SequenceMatcher(None, str1, str2)
+    return seq_match.ratio()
+
+# Function that splits model words into numeric and non-numeric parts
+def split_model_word(model_word):
+    non_numeric = re.sub(r'[0-9]', '', model_word)
+    numeric = re.sub(r'[^0-9]', '', model_word)
+    return non_numeric, numeric
+
+# Function that extracts model words with both numeric and alphabetic characters
+def extract_model_words(title):
+    model_word_pattern = r'([a-zA-Z]+[0-9]+[a-zA-Z0-9]*)'
+    return re.findall(model_word_pattern, title.lower())
+
+# Function that computes the similarity between model words in titles of two products
+def calculate_title_words_similarity(product1, product2, threshold=0):
+    title1_model_words = set(extract_model_words(product1.get('title', '')))
+    title2_model_words = set(extract_model_words(product2.get('title', '')))
+    similarities = []
+    
+    for word1 in title1_model_words:
+        for word2 in title2_model_words:
+            non_numeric1, numeric1 = split_model_word(word1)
+            non_numeric2, numeric2 = split_model_word(word2)
+            non_numeric_similarity = normalized_levenshtein(non_numeric1, non_numeric2)
+            
+            if numeric1 == numeric2 and non_numeric_similarity >= threshold:
+                similarity = (non_numeric_similarity + 1) / 2
+                similarities.append(similarity)
+                
+    return sum(similarities) / len(similarities) if similarities else 0
+
+# Compute TMWM
+def TMWM(product1, product2, alpha=0.7, delta=0.7, beta=0.3):
+    product1_words = product1['title'].split()
+    product2_words = product2['title'].split()
+    intersection = len(set(product1_words).intersection(product2_words))
+    cosine = intersection / (np.sqrt(len(product1_words)) * np.sqrt(len(product2_words)))
+
+    if cosine > alpha:
+        return 1
+    else:
+        mw_product1 = extract_model_words(product1['title'])
+        mw_product2 = extract_model_words(product2['title'])
+
+        for word1 in mw_product1:
+            for word2 in mw_product2:
+                non_numeric_sim = normalized_levenshtein(split_model_word(word1)[0], split_model_word(word2)[0])
+                numeric_sim = normalized_levenshtein(split_model_word(word1)[1], split_model_word(word2)[1])
+
+                if non_numeric_sim > 0.7 and numeric_sim < 1:
+                    return -1
+
+        final_name_sim = beta * cosine + (1 - beta) * calculate_title_words_similarity(product1, product2)
+        
+        for word1 in mw_product1:
+            for word2 in mw_product2:
+                non_numeric_sim = normalized_levenshtein(split_model_word(word1)[0], split_model_word(word2)[0])
+                numeric_sim = normalized_levenshtein(split_model_word(word1)[1], split_model_word(word2)[1])
+
+                if non_numeric_sim > 0.7 and numeric_sim == 1:
+                    model_word_sim_val = calculate_title_words_similarity(product1, product2)
+                    final_name_sim = delta * model_word_sim_val + (1 - delta) * final_name_sim
+                    return final_name_sim
+
+        return final_name_sim
+
+
+
+######################## Part 7.1: dissimilarity matrix - similarity matrices ########################
+
+
+# Function that precomputes the similarities for faster bootstrapping
+def precompute_similarity_matrices(data):
+    num_products = len(data)
+    hsm_matrix = np.zeros((num_products, num_products))
+    kvp_matrix = np.zeros((num_products, num_products))
+    title_matrix = np.zeros((num_products, num_products))
+
+    for i in range(num_products):
+        for j in range(i + 1, num_products):  # Use symmetry to reduce computation
+            # Check conditions: same brand and not the same webshop
+            if data[i]['brand'] == data[j]['brand'] and data[i]['shop'] != data[j]['shop']:
+                hsm_matrix[i, j] = hsm_matrix[j, i] = calculate_hsm_similarity(data[i], data[j])
+                kvp_matrix[i, j] = kvp_matrix[j, i] = calculate_kvp_similarity(data[i], data[j])
+                title_matrix[i, j] = title_matrix[j, i] = TMWM(data[i], data[j])
+
+    return hsm_matrix, kvp_matrix, title_matrix
+
+# Precompute the similarity matrices
+hsm_matrix, kvp_matrix, title_matrix = precompute_similarity_matrices(data)
+
+
+######################## Part 7.2: dissimilarity matrix - combination function ########################
+
+
+# Function that applies the weights to the similarities to one total dissimilarity matrix
+def weight_dissimilarity_matrix(data, lsh_buckets, precomputed_matrices, weights):
+    num_products = len(data)
+    hsm_matrix, kvp_matrix, title_matrix = precomputed_matrices
+    w_hsm, w_kvp, w_title = weights
+
+    # Create a dissimilarity matrix initialized with infinity
+    dissimilarity_matrix = np.full((num_products, num_products), np.inf)
+
+    # Flatten LSH buckets to a set for easy lookup
+    bucket_pairs = set()
+    for bucket in lsh_buckets.values():
+        for pair in combinations(bucket, 2):
+            bucket_pairs.add(frozenset(pair))
+
+    # Create a mask for pairs in the same LSH bucket and satisfying brand and shop conditions
+    mask = np.zeros((num_products, num_products), dtype=bool)
+
+    for i in range(num_products):
+        for j in range(num_products):
+            if frozenset((i, j)) in bucket_pairs and data[i]['brand'] == data[j]['brand'] and data[i]['shop'] != data[j]['shop']:
+                mask[i, j] = True
+
+    # Extract old numeric ids
+    old_ids = [product['old_numeric_id'] for product in data]
+
+    # Calculate weighted similarity for valid pairs
+    valid_pairs_hsm = hsm_matrix[old_ids, :][:, old_ids][mask]
+    valid_pairs_kvp = kvp_matrix[old_ids, :][:, old_ids][mask]
+    valid_pairs_title = title_matrix[old_ids, :][:, old_ids][mask]
+
+    weighted_similarity = w_hsm * valid_pairs_hsm + w_kvp * valid_pairs_kvp + w_title * valid_pairs_title
+
+    # Assign weighted dissimilarity to the matrix
+    dissimilarity_matrix[mask] = 1 - weighted_similarity
+
+    return dissimilarity_matrix
+
+
+######################## Part 8.1: msm - definition clustering ########################
+
+
+# Make a function that applies hierarchical clustering
+def hierarchical_clustering(dissimilarity_matrix, threshold=0.5, high_dissimilarity=1e5):
+    dissimilarity_matrix[dissimilarity_matrix == np.inf] = high_dissimilarity
+    np.fill_diagonal(dissimilarity_matrix, 0)
+    condensed_matrix = squareform(dissimilarity_matrix)
+    Z = linkage(condensed_matrix, method='single')
+    return fcluster(Z, threshold, criterion='distance')
+
+# Make a function that finds the predicted duplicate pairs
+def find_duplicate_pairs(data, clusters):
+    clustered_products = defaultdict(list)
+
+    # Group products by their cluster, using numeric_id as the identifier
+    for product_index, cluster_id in enumerate(clusters):
+        clustered_products[cluster_id].append(data[product_index]['numeric_id'])
+
+    duplicate_pairs = []
+    for cluster_id, products in clustered_products.items():
+        if len(products) > 1:  # Only consider clusters with more than one product as duplicates
+            for pair in combinations(products, 2):  # Generating all possible pairs
+                duplicate_pairs.append(pair)
+
+    return duplicate_pairs
+
+
+######################## Part 8.2: msm - loop over all possibilities ########################
+
+
+# Function that computes the metrics for evaluation of MSM in the bootstrap
+def calculate_metrics(predicted_duplicates, actual_duplicates):
+    # Calculate True Positives, False Positives, and False Negatives
+    true_positives = len(actual_duplicates.intersection(predicted_duplicates))
+    false_positives = len(predicted_duplicates.difference(actual_duplicates))
+    false_negatives = len(actual_duplicates.difference(predicted_duplicates))
+
+    # Calculate Precision, Recall, and F1 Score
+    precision = true_positives / len(predicted_duplicates) if predicted_duplicates else 0
+    recall = true_positives / len(actual_duplicates) if actual_duplicates else 0
+    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
+
+    return precision, recall, f1_score
+
+# Function that runs MSM for all possible b and r combinations
+def evaluate_lsh_with_thresholds_and_weights(num_hashes, data, data_duplicates, thresholds, band_row_combinations, signature_matrix, w_title, w_kvp, w_hsm):
+    results = []
+    total_possible_comparisons = len(data) * (len(data) - 1) // 2
+    actual_duplicates_set = {frozenset(pair) for pair in data_duplicates}
+
+    for threshold in thresholds:
+        for b, r in band_row_combinations:
+            lsh_buckets = locality_sensitive_hashing(signature_matrix, b, r)
+            dissimilarity_matrix = create_dissimilarity_matrix(data, lsh_buckets, w_title, w_kvp, w_hsm)
+            clusters = hierarchical_clustering(dissimilarity_matrix, threshold)
+            predicted_duplicates = find_duplicate_pairs(data, clusters)
+            predicted_duplicates_set = {frozenset(pair) for pair in predicted_duplicates}
+
+            precision, recall, f1_score = calculate_metrics(predicted_duplicates_set, actual_duplicates_set)
+            fraction_of_comparisons = calculate_fraction_of_comparisons(lsh_buckets, total_possible_comparisons)
+
+            results.append({
+                "threshold": threshold,
+                "bands": b,
+                "rows": r,
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1_score,
+                "fraction_of_comparisons": fraction_of_comparisons,
+                "w_title": w_title,
+                "w_kvp": w_kvp,
+                "w_hsm": w_hsm
+            })
+
+    return results
+
+
+######################## Part 9.1: bootstrap - lsh evaluation metrics ########################
+
+
+# Function that computes the evaluation metrics of LSH
+def calculate_pair_metrics(lsh_buckets, data_duplicates):
+    nr_duplicates_found = 0
+    found_duplicate_pairs = set()
+
+    for _, product_indices in lsh_buckets.items():
+        for duplicate_pair in data_duplicates:
+            if duplicate_pair.issubset(product_indices) and duplicate_pair not in found_duplicate_pairs:
+                nr_duplicates_found += 1
+                found_duplicate_pairs.add(duplicate_pair)
+
+    nr_comparisons = sum(len(indices) * (len(indices) - 1) // 2 for indices in lsh_buckets.values())
+    total_actual_duplicate_pairs = len(data_duplicates)
+
+    pair_quality = nr_duplicates_found / nr_comparisons if nr_comparisons else 0
+    pair_completeness = nr_duplicates_found / total_actual_duplicate_pairs if total_actual_duplicate_pairs else 0
+
+    return pair_quality, pair_completeness
+
+# Function that evaluates the test set for LSH
+def evaluate_test_buckets(test_data, test_duplicates, test_lsh_buckets):
+    # Calculate Pair Quality and Pair Completeness for the test buckets
+    pair_quality, pair_completeness = calculate_pair_metrics(test_lsh_buckets, test_duplicates)
+
+    # Calculate F1* score (Harmonic mean of pair quality and pair completeness)
+    f1_star = hmean([pair_quality, pair_completeness]) if pair_quality and pair_completeness else 0
+
+    return pair_quality, pair_completeness, f1_star
+
+
+######################## Part 9.2: bootstrap - total bootstrap ########################
+
+
+# Function that runs the complete bootstrap
+def bootstrap(data, data_duplicates, binary_vectors, subset_size, num_bootstraps, num_hashes, weight_combinations, thresholds, precomputed_matrices):
+    bootstraps = []
+    results_evaluation_msm = []
+    test_results = []
+
+    valid_band_row_combinations = [(b, num_hashes // b) for b in range(1, num_hashes + 1) if num_hashes % b == 0]
+
+    total_iterations = num_bootstraps * len(valid_band_row_combinations) * len(weight_combinations) * len(thresholds)
+    current_iteration = 0
+
+    for _ in range(num_bootstraps):
+        data_bootstrap = copy.deepcopy(data)
+        duplicates_bootstrap = copy.deepcopy(data_duplicates)
+
+        train_data, train_duplicates, test_data, test_duplicates = generate_train_test_split(subset_size, data_bootstrap, duplicates_bootstrap)
+
+        if not test_duplicate_correction(train_data, train_duplicates) or not test_duplicate_correction(test_data, test_duplicates):
+            print("Duplicate correction failed. Stopping the loop.")
+            break
+        
+        train_binary_vectors = [binary_vectors[product['old_numeric_id']] for product in train_data]
+        test_binary_vectors = [binary_vectors[product['old_numeric_id']] for product in test_data]
+    
+        train_signature_matrix = create_signature_matrix(train_binary_vectors, num_hashes)
+        test_signature_matrix = create_signature_matrix(test_binary_vectors, num_hashes)
+
+        train_lsh_buckets_all = {}
+        test_lsh_buckets_all = {}
+
+        for b, r in valid_band_row_combinations:
+            train_lsh_buckets = locality_sensitive_hashing(train_signature_matrix, b, r)
+            test_lsh_buckets = locality_sensitive_hashing(test_signature_matrix, b, r)
+
+            train_lsh_buckets_all[(b, r)] = train_lsh_buckets
+            test_lsh_buckets_all[(b, r)] = test_lsh_buckets
+            
+            train_fraction_of_comparisons = calculate_fraction_of_comparisons(train_lsh_buckets, len(train_binary_vectors) * (len(train_binary_vectors) - 1) // 2)
+            test_fraction_of_comparisons = calculate_fraction_of_comparisons(test_lsh_buckets, len(test_binary_vectors) * (len(test_binary_vectors) - 1) // 2)
+
+            train_results = []
+            for w_hsm, w_kvp, w_title in weight_combinations:
+                for threshold in thresholds:
+                    current_iteration += 1
+                    print(f"Iteration {current_iteration}/{total_iterations} ({100 * current_iteration/total_iterations:.2f}%)")
+
+                    # Use the weight_dissimilarity_matrix function here
+                    train_dissimilarity_matrix = weight_dissimilarity_matrix(train_data, train_lsh_buckets, precomputed_matrices, (w_hsm, w_kvp, w_title))
+                    clusters = hierarchical_clustering(train_dissimilarity_matrix, threshold)
+                    predicted_duplicates = find_duplicate_pairs(train_data, clusters)
+                    predicted_duplicates_set = {frozenset(pair) for pair in predicted_duplicates}
+
+                    precision, recall, f1_score = calculate_metrics(predicted_duplicates_set, train_duplicates)
+                    train_results.append({
+                        "bootstrap_iteration": _,
+                        "bands": b,
+                        "rows": r,
+                        "threshold": threshold,
+                        "w_hsm": w_hsm,
+                        "w_kvp": w_kvp,
+                        "w_title": w_title,
+                        "precision": precision,
+                        "recall": recall,
+                        "f1_score": f1_score
+                    })
+            
+            best_params = max(train_results, key=lambda x: x['f1_score'])
+            results_evaluation_msm.extend(train_results)
+
+            test_lsh_buckets = test_lsh_buckets_all[(best_params['bands'], best_params['rows'])]
+            pair_quality, pair_completeness = calculate_pair_metrics(test_lsh_buckets, test_duplicates)
+            f1_star = hmean([pair_quality, pair_completeness]) if pair_quality and pair_completeness else 0
+            test_dissimilarity_matrix = weight_dissimilarity_matrix(test_data, test_lsh_buckets, precomputed_matrices, (best_params['w_hsm'], best_params['w_kvp'], best_params['w_title']))
+            clusters = hierarchical_clustering(test_dissimilarity_matrix, best_params['threshold'])
+            predicted_duplicates = find_duplicate_pairs(test_data, clusters)
+            predicted_duplicates_set = {frozenset(pair) for pair in predicted_duplicates}
+
+            precision, recall, f1_score = calculate_metrics(predicted_duplicates_set, test_duplicates)
+            test_results.append({
+                "bootstrap_iteration": _,
+                "bands": best_params['bands'],
+                "rows": best_params['rows'],
+                "threshold": best_params['threshold'],
+                "w_hsm": best_params['w_hsm'],
+                "w_kvp": best_params['w_kvp'],
+                "w_title": best_params['w_title'],
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1_score,
+                "fraction_of_comparisons": test_fraction_of_comparisons,
+                "pair_quality": pair_quality,
+                "pair_completeness": pair_completeness,
+                "F1_star": f1_star
+            })
+
+        bootstraps.append({
+            'train': {
+                'data': train_data,
+                'duplicates': train_duplicates,
+                'binary_vectors': train_binary_vectors,
+                'signature_matrix': train_signature_matrix,
+                'lsh_buckets': train_lsh_buckets_all
+            },
+            'test': {
+                'data': test_data,
+                'duplicates': test_duplicates,
+                'binary_vectors': test_binary_vectors,
+                'signature_matrix': test_signature_matrix,
+                'lsh_buckets': test_lsh_buckets_all
+            }
+        })
+
+    return bootstraps, pd.DataFrame(results_evaluation_msm), pd.DataFrame(test_results)
+
+
+######################## Part 9.3: bootstrap - running the code ########################
+
+
+# Define the weight matrices
+precomputed_matrices = (hsm_matrix, kvp_matrix, title_matrix)
+
+# Define thresholds epsilon
+thresholds = np.arange(0.1, 1, 0.1)
+
+# Define weight combinations of the similarities
+weight_combinations = [(x/10, y/10, z/10) for x in range(1, 10) for y in range(2, 10) for z in range(2, 10) if x + y + z == 10]
+
+# Run the complete bootstrap
+bootstraps, train_results_df, test_results_df = bootstrap(data, data_duplicates, binary_vectors, 1024, 5, 800, weight_combinations, thresholds, precomputed_matrices)
+
+######################## Part 9.4: bootstrap - plotting ########################
+
+
+# Aggregate the bootstraps
+mean_values_best = test_results_df.groupby('bands').agg({
+    'fraction_of_comparisons': 'mean',
+    'f1_score': 'mean',
+    'F1_star': 'mean',
+    'pair_completeness': 'mean',
+    'pair_quality': 'mean'
+})
+
+# Creating the plot for PC
+plt.figure(figsize=(10, 6))
+plt.plot(mean_values_best['fraction_of_comparisons'], mean_values_best['pair_completeness'], color='black', marker='')
+plt.xlabel('Fraction of Comparisons', fontsize=18)
+plt.ylabel('Pair Completeness', fontsize=18)
+plt.xticks(np.arange(0, 1.1, 0.1), fontsize=18)
+plt.yticks(np.arange(0, 1.1, 0.1), fontsize=18)
+plt.xlim(-0.03, 1)
+plt.ylim(-0.03, 1.05)
+plt.grid(False)
+#plt.title('F1 Score vs Fraction of Comparisons', fontsize=16)
+plt.show()
+
+# Creating the plot for PQ
+plt.figure(figsize=(10, 6))
+plt.plot(mean_values_best['fraction_of_comparisons'], mean_values_best['pair_quality'], color='black', marker='')
+plt.xlabel('Fraction of Comparisons', fontsize=18)
+plt.ylabel('Pair Quality', fontsize=18)
+plt.xticks(np.arange(0, 1.1, 0.01), fontsize=18)
+plt.yticks(np.arange(0, 1.1, 0.01), fontsize=18)
+plt.xlim(-0.003, 0.1)
+plt.ylim(-0.003, 0.1)
+plt.grid(False)
+#plt.title('F1 Score vs Fraction of Comparisons', fontsize=16)
+plt.show()
+
+# Creating the plot for F1*
+plt.figure(figsize=(10, 6))
+plt.plot(mean_values_best['fraction_of_comparisons'], mean_values_best['F1_star'], color='black', marker='')
+plt.xlabel('Fraction of Comparisons', fontsize=18)
+plt.ylabel('F1* Score', fontsize=18)
+plt.xticks(np.arange(0, 1.1, 0.01), fontsize=18)
+plt.yticks(np.arange(0, 1.1, 0.01), fontsize=18)
+plt.xlim(-0.003, 0.062)
+plt.ylim(-0.003, 0.062)
+plt.grid(False)
+#plt.title('F1 Score vs Fraction of Comparisons', fontsize=16)
+plt.show()
+
+# Creating the plot for F1
+plt.figure(figsize=(10, 6))
+plt.plot(mean_values_best['fraction_of_comparisons'], mean_values_best['f1_score'], color='black', marker='')
+plt.xlabel('Fraction of Comparisons', fontsize=18)
+plt.ylabel('F1 Score', fontsize=18)
+plt.xticks(np.arange(0, 1.1, 0.1), fontsize=18)
+plt.yticks(np.arange(0, 1.1, 0.1), fontsize=18)
+plt.xlim(-0.003, 1)
+plt.ylim(-0.003, 1)
+plt.grid(False)
+#plt.title('F1 Score vs Fraction of Comparisons', fontsize=16)
+plt.show()
+
